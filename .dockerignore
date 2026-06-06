@@ -1,0 +1,66 @@
+# Git
+.git/
+.gitignore
+.github/
+
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+*.egg/
+
+# Node
+**/node_modules/
+.yarn/
+.pnp
+.pnp.js
+
+# Build outputs
+**/.next/
+**/dist/
+**/build/
+*.log
+npm-debug.log*
+yarn-error.log
+
+# IDE
+.idea/
+.vscode/
+
+# Environment
+.env
+.env.local
+.env.*.local
+.env.production
+.env.*.production
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific (large/generated)
+investigations/
+!web/app/investigations/
+seed_data.json.gz
+**/chroma_db/
+
+# Cache
+**/.cache/
+.pytest_cache/
+.mypy_cache/
+.eslint_cache/
+.turbo/
+coverage/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+**/postgres_data/
+**/tor_data/

@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open_intel"
+version = "1.4.7"
+description = "Dark web OSINT CLI — automated threat intelligence from query to report"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Open_Intel" }]
+keywords = ["osint", "darkweb", "threat-intelligence", "tor", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "textual>=0.60",
+    "aiohttp>=3.9",
+    "aiohttp-socks>=0.8",
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.20",
+    "langchain>=0.2",
+    "langchain-openai>=0.1",
+    "langchain-anthropic>=0.1",
+    "langchain-google-genai>=1.0",
+    "langchain-groq>=0.1",
+    "langchain-ollama>=0.1",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "spacy>=3.7",
+    "beautifulsoup4>=4.12",
+    "feedparser>=6.0",
+    "python-dateutil>=2.9",
+    "trafilatura>=1.6",
+    "requests>=2.31",
+    "python-socks>=2.4",
+    "tldextract>=5.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+open_intel = "open_intel_cli.main:app"
+
+[tool.setuptools]
+py-modules = ["config"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "open_intel_cli*",
+    "db*",
+    "sources*",
+    "extractor*",
+    "scraper*",
+    "search*",
+    "utils*",
+    "export*",
+    "analysis*",
+    "fingerprint*",
+    "graph*",
+    "i18n*",
+    "vector*",
+    "monitor*",
+    "crawler*",
+    "auth*",
+    "open_intel*",
+    "api*",
+]
+exclude = [
+    "tests*",
+    "web*",
+    "va_final_qa*",
+    "infra*",
+    "chroma_db*",
+    "cti_data*",
+    "data*",
+    "docs*",
+    "scripts*",
+    "public*",
+    "__pycache__*",
+]

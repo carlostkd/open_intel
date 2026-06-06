@@ -1,0 +1,56 @@
+# ============================================================
+# VoidAccess Next.js Dockerfile (Optimized)
+# ============================================================
+
+FROM node:20-alpine AS builder
+
+# Set build-time environment variables
+ARG NEXT_PUBLIC_API_URL=http://fastapi:8000
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+
+WORKDIR /app
+
+# Copy package files first for layer caching
+COPY web/package.json web/package-lock.json ./
+
+# Install dependencies with BuildKit cache mount
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+
+# Copy application code
+COPY web/ .
+
+# Build Next.js
+RUN npm run build
+
+
+# --- Production stage ---
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Application files are owned by the existing 'node' user (UID 1000)
+# which is already present in node-alpine images.
+RUN chown -R node:node /app
+
+# Copy built app from builder (standalone mode)
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+# Standalone mode copies everything into . (the working directory)
+# so additional chown is only needed if folders were created as root.
+COPY --from=builder /app/public ./public
+
+# Runtime Environment
+ENV NODE_ENV=production
+ENV NEXT_PUBLIC_API_URL=http://fastapi:8000
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/api/health || exit 1
+
+USER node
+
+CMD ["node", "server.js"]

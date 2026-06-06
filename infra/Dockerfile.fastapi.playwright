@@ -1,0 +1,110 @@
+# ============================================================
+# VoidAccess FastAPI Dockerfile with Playwright (opt-in)
+# Use: docker build -f Dockerfile.fastapi.playwright -t voidaccess:playwright .
+# ============================================================
+
+ARG GPU=false
+ARG OTX_API_KEY=""
+ARG ABUSECH_API_KEY=""
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN --mount=type=cache,target=/root/.pip \
+    if [ "$GPU" = "true" ]; then \
+        pip install --no-cache-dir -r requirements.txt; \
+    else \
+        pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+        pip install --no-cache-dir --no-deps -r requirements.txt; \
+    fi
+
+RUN --mount=type=cache,target=/root/.pip \
+    pip install --no-cache-dir playwright && \
+    playwright install chromium && \
+    playwright install-deps chromium
+
+COPY scripts/ scripts/
+
+RUN --mount=type=cache,target=/root/.pip \
+    if [ -n "$OTX_API_KEY" ] || [ -n "$ABUSECH_API_KEY" ]; then \
+        OTX_API_KEY=$OTX_API_KEY ABUSECH_API_KEY=$ABUSECH_API_KEY \
+        python scripts/download_seed.py || true; \
+    fi
+
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-client \
+    netcat-openbsd \
+    curl \
+    libglib2.0-0 \
+    libnss3 \
+    libnspr4 \
+    libdbus-1-3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libatspi2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 1000 voidaccess && \
+    useradd --uid 1000 --gid voidaccess --shell /bin/bash --create-home voidaccess
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY --from=builder /app/data/seed_data.json.g[z] /data/seed_data.json.gz
+
+RUN mkdir -p /data /app && chown -R voidaccess:voidaccess /app /data
+
+COPY --chown=voidaccess:voidaccess . .
+
+RUN python -c "import spacy; spacy.load('en_core_web_sm')" 2>/dev/null || \
+    python -m spacy download en_core_web_sm
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV TF_ENABLE_ONEDNN_OPTS=0
+ENV TF_CPP_MIN_LOG_LEVEL=3
+ENV DATABASE_URL=postgresql://voidaccess:voidaccess@postgres:5432/voidaccess
+ENV TOR_PROXY_HOST=tor
+ENV TOR_PROXY_PORT=9050
+ENV PLAYWRIGHT_ENABLED=true
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+RUN chmod +x /app/infra/*.sh && chmod +x /app/*.sh 2>/dev/null || true
+
+USER voidaccess
+
+ENTRYPOINT ["/app/infra/docker-entrypoint.sh"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

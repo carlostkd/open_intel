@@ -1,0 +1,462 @@
+"""
+crawler/spider.py — Async recursive .onion spider (Phase 1C).
+
+Public API:
+    CrawlResult   dataclass — returned by crawl()
+    crawl()       async function — main entry point
+
+All HTTP requests go through the Tor SOCKS5 proxy (TOR_PROXY_HOST /
+TOR_PROXY_PORT from config.py).  No clearnet requests to dark web targets.
+
+Politeness rules (non-negotiable for Tor stability):
+  - Same domain  → random 2–8 s delay between consecutive requests
+  - New domain   → random 0.5–2 s delay on first access
+  - Per-domain concurrency cap: 3 simultaneous requests (asyncio.Semaphore)
+  - 1 MB download cap per page (identical to scrape.py)
+
+Error handling:
+  - A failed page is logged, its source marked 'failed' in the DB, and the
+    crawl continues — a single bad page never terminates the run.
+  - Retry/backoff mirrors scrape.py: up to 3 retries (2 s / 4 s / 8 s),
+    no retry on 4xx responses.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import random
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import aiohttp
+from aiohttp_socks import ProxyConnector
+
+from config import TOR_PROXY_HOST, TOR_PROXY_PORT
+from crawler.dedup import ContentDedup, UrlDedup
+from crawler.frontier import Frontier
+from crawler.utils import extract_onion_links, is_valid_onion, normalize_url
+from scraper.scrape import _extract_text
+
+_logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants (mirror scrape.py where applicable)
+# ---------------------------------------------------------------------------
+
+MAX_DOWNLOAD_BYTES = 1_000_000          # 1 MB hard cap
+MAX_RETURN_CHARS = 2_000                # truncation in results list
+MAX_RETRIES = 3
+RETRY_DELAYS = (2.0, 4.0, 8.0)         # seconds before retry 1, 2, 3
+RETRYABLE_STATUS = {500, 502, 503, 504}
+ALLOWED_CONTENT_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
+
+_SAME_DOMAIN_DELAY = (2.0, 8.0)        # seconds, random within range
+_NEW_DOMAIN_DELAY = (0.5, 2.0)         # seconds, random within range
+_DOMAIN_MAX_CONCURRENT = 3             # asyncio.Semaphore value per domain
+_GLOBAL_CONCURRENCY = 10               # max simultaneous page fetches overall
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) "
+    "Gecko/20100101 Firefox/137.0"
+)
+
+
+# ---------------------------------------------------------------------------
+# Return type
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CrawlResult:
+    """
+    Summary of a completed crawl run.
+
+    *results* is a list of dicts, each with keys "url" and "content",
+    shaped the same as individual entries from scrape_multiple() so both
+    are interchangeable in the intelligence pipeline.
+    """
+    pages_crawled: int = 0
+    pages_failed: int = 0
+    new_urls_discovered: int = 0
+    results: List[Dict] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Spider
+# ---------------------------------------------------------------------------
+
+class Spider:
+    """
+    Recursive async .onion crawler.
+
+    Instantiate once per crawl run; do not reuse across runs.
+    """
+
+    def __init__(
+        self,
+        seed_urls: List[str],
+        query: str,
+        max_depth: int = 2,
+        max_pages: int = 200,
+        min_relevance: float = 0.3,
+    ) -> None:
+        self.seed_urls = seed_urls
+        self.query = query
+        self.max_depth = max_depth
+        self.max_pages = max_pages
+        self.min_relevance = min_relevance
+
+        self._frontier = Frontier(query)
+        self._url_dedup = UrlDedup()
+        self._content_dedup = ContentDedup()
+
+        # Per-domain politeness state
+        self._domain_semaphores: Dict[str, asyncio.Semaphore] = defaultdict(
+            lambda: asyncio.Semaphore(_DOMAIN_MAX_CONCURRENT)
+        )
+        self._domain_last_access: Dict[str, float] = {}
+        self._timing_lock = asyncio.Lock()
+
+        # Counters
+        self._pages_crawled = 0
+        self._pages_failed = 0
+        self._new_urls_discovered = 0
+        self._results: List[Dict] = []
+
+    # ------------------------------------------------------------------
+    # Politeness
+    # ------------------------------------------------------------------
+
+    async def _polite_delay(self, domain: str) -> None:
+        """
+        Compute and sleep the required inter-request delay for *domain*.
+
+        Uses _timing_lock to read/update last-access atomically in the
+        event loop; the actual sleep happens outside the lock so other
+        coroutines are not blocked.
+        """
+        async with self._timing_lock:
+            last = self._domain_last_access.get(domain)
+            now = time.monotonic()
+            if last is None:
+                delay = random.uniform(*_NEW_DOMAIN_DELAY)
+            else:
+                elapsed = now - last
+                needed = random.uniform(*_SAME_DOMAIN_DELAY)
+                delay = max(0.0, needed - elapsed)
+            # Reserve the slot so concurrent coroutines don't both sleep 0
+            self._domain_last_access[domain] = now + delay
+
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    # ------------------------------------------------------------------
+    # Fetch with retry (mirrors scrape.py's _fetch_one)
+    # ------------------------------------------------------------------
+
+    async def _fetch(
+        self,
+        url: str,
+        session: aiohttp.ClientSession,
+    ) -> Optional[Tuple[bytes, str, str]]:
+        """
+        Fetch *url* with exponential-backoff retry.
+
+        Returns (raw_bytes, html, extracted_text) on success, or None on
+        any unrecoverable failure.  Never raises.
+        """
+        headers = {
+            "User-Agent": _USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+        }
+        last_exc: object = None
+
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt > 0:
+                await asyncio.sleep(RETRY_DELAYS[attempt - 1])
+
+            try:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status in RETRYABLE_STATUS:
+                        last_exc = f"HTTP {resp.status}"
+                        continue
+
+                    if resp.status != 200:
+                        return None  # 4xx — not retried
+
+                    ct = (resp.headers.get("Content-Type") or "").lower()
+                    if ct and not any(t in ct for t in ALLOWED_CONTENT_TYPES):
+                        return None
+
+                    # Stream with 1 MB hard cap
+                    chunks: List[bytes] = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(8192):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            break
+                        chunks.append(chunk)
+
+                    raw_bytes = b"".join(chunks)
+                    html = raw_bytes.decode(resp.charset or "utf-8", errors="replace")
+                    text = _extract_text(html)
+                    return raw_bytes, html, text
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+
+        _logger.debug("All retries exhausted for %s: %s", url, last_exc)
+        return None
+
+    # ------------------------------------------------------------------
+    # DB helpers (pattern from scrape.py _persist_pages)
+    # ------------------------------------------------------------------
+
+    def _db_upsert_source(self, url: str, status: str) -> None:
+        """
+        Upsert the .onion domain for *url* into the sources table.
+
+        Only sets *status* when the row is newly created; existing rows are
+        left at their current status so we never downgrade 'active' → 'discovered'.
+        If *status* is 'failed' or 'active' it is always applied (overwrite).
+        """
+        try:
+            from config import DATABASE_URL as _db_url
+            if not _db_url:
+                return
+            from db.queries import get_or_create_source, update_source_status
+            from db.session import get_session
+        except ImportError:
+            return
+
+        try:
+            hostname = (urlparse(url).hostname or "").lower()
+            if not hostname.endswith(".onion"):
+                return
+            with get_session() as session:
+                src, created = get_or_create_source(
+                    session, hostname, source_type="crawled"
+                )
+                # Always apply terminal statuses; only apply 'discovered' to new rows
+                if status in ("active", "failed") or created:
+                    update_source_status(session, src.id, status)
+        except Exception as exc:
+            _logger.debug("DB source upsert failed url=%s status=%s: %s", url, status, exc)
+
+    def _db_persist_page(
+        self,
+        url: str,
+        raw_bytes: bytes,
+        text: str,
+        content_hash: str,
+    ) -> None:
+        """Write a successfully scraped page to the database."""
+        try:
+            from config import DATABASE_URL as _db_url
+            if not _db_url:
+                return
+            from db.queries import create_page, get_or_create_source, update_source_status
+            from db.session import get_session
+        except ImportError:
+            return
+
+        try:
+            with get_session() as session:
+                hostname = (urlparse(url).hostname or "").lower()
+                source_id = None
+                if hostname.endswith(".onion"):
+                    src, _ = get_or_create_source(
+                        session, hostname, source_type="crawled"
+                    )
+                    update_source_status(session, src.id, "active")
+                    source_id = src.id
+
+                create_page(
+                    session,
+                    url=url,
+                    source_id=source_id,
+                    cleaned_text=text,
+                    raw_content_hash=content_hash,
+                    byte_size=len(raw_bytes),
+                )
+        except Exception as exc:
+            _logger.debug("DB page persist failed url=%s: %s", url, exc)
+
+    # ------------------------------------------------------------------
+    # Core page processing
+    # ------------------------------------------------------------------
+
+    async def _process_url(
+        self,
+        url: str,
+        depth: int,
+        session: aiohttp.ClientSession,
+    ) -> None:
+        """
+        Fetch *url*, extract links, and update all state.
+
+        Acquires the per-domain semaphore after the politeness delay so at
+        most _DOMAIN_MAX_CONCURRENT fetches to the same domain run in
+        parallel at any time.
+        """
+        domain = (urlparse(url).hostname or url).lower()
+        await self._polite_delay(domain)
+
+        async with self._domain_semaphores[domain]:
+            try:
+                result = await self._fetch(url, session)
+
+                if result is None:
+                    self._pages_failed += 1
+                    _logger.debug("Fetch returned None for %s", url)
+                    self._db_upsert_source(url, "failed")
+                    return
+
+                raw_bytes, html, text = result
+                content_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+                # Content dedup: skip DB write if hash already stored
+                if not self._content_dedup.is_duplicate(content_hash):
+                    self._db_persist_page(url, raw_bytes, text, content_hash)
+                else:
+                    # Source still reached successfully — keep status accurate
+                    self._db_upsert_source(url, "active")
+
+                self._pages_crawled += 1
+
+                # Truncate content for the results list
+                snippet = (text or "")[:MAX_RETURN_CHARS]
+                suffix = "...(truncated)"
+                if len(text or "") > MAX_RETURN_CHARS:
+                    available = MAX_RETURN_CHARS - len(suffix)
+                    snippet = (text[:available] + suffix) if available > 0 else suffix
+
+                self._results.append({"url": url, "content": snippet})
+
+                # Extract and enqueue child links
+                if depth < self.max_depth:
+                    links = extract_onion_links(html, base_url=url)
+                    for link in links:
+                        normed = normalize_url(link)
+                        if not normed:
+                            continue
+                        if self._url_dedup.is_new(normed):
+                            self._new_urls_discovered += 1
+                            self._url_dedup.mark_seen(normed)
+                            self._db_upsert_source(normed, "discovered")
+
+                            link_score = self._frontier.score(normed, (text or "")[:500])
+                            if link_score >= self.min_relevance:
+                                self._frontier.push(normed, depth + 1, link_score)
+
+            except Exception as exc:
+                self._pages_failed += 1
+                _logger.warning("Unexpected error processing %s: %s", url, exc, exc_info=True)
+                self._db_upsert_source(url, "failed")
+
+    # ------------------------------------------------------------------
+    # Main crawl loop
+    # ------------------------------------------------------------------
+
+    async def run(self) -> CrawlResult:
+        """
+        Execute the full crawl and return a CrawlResult.
+
+        Flow:
+          1. Normalize and validate seed URLs → push to frontier (score=1.0)
+          2. Open one Tor-proxied aiohttp session for the entire run
+          3. Dispatch up to _GLOBAL_CONCURRENCY concurrent _process_url tasks
+          4. Replenish tasks as each completes; stop when frontier is empty
+             or max_pages total have been processed
+        """
+        for url in self.seed_urls:
+            normed = normalize_url(url)
+            if not normed or not is_valid_onion(normed):
+                _logger.warning("Skipping invalid seed URL: %s", url)
+                continue
+            if self._url_dedup.is_new(normed):
+                self._url_dedup.mark_seen(normed)
+                self._db_upsert_source(normed, "discovered")
+                self._frontier.push(normed, depth=0, score=1.0)
+
+        if self._frontier.empty():
+            _logger.warning("No valid seed URLs; returning empty CrawlResult.")
+            return CrawlResult()
+
+        timeout = aiohttp.ClientTimeout(connect=10, sock_read=45)
+        connector = ProxyConnector.from_url(
+            f"socks5://{TOR_PROXY_HOST}:{TOR_PROXY_PORT}",
+            rdns=True,
+        )
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            active: set[asyncio.Task] = set()
+            total_processed = 0
+
+            while True:
+                # Fill task pool up to concurrency cap while pages remain
+                while (
+                    not self._frontier.empty()
+                    and len(active) < _GLOBAL_CONCURRENCY
+                    and total_processed + len(active) < self.max_pages
+                ):
+                    url, depth = self._frontier.pop()
+                    task = asyncio.create_task(
+                        self._process_url(url, depth, session),
+                        name=f"crawl:{url}",
+                    )
+                    active.add(task)
+
+                if not active:
+                    break  # frontier empty, nothing in flight
+
+                done, active = await asyncio.wait(
+                    active, return_when=asyncio.FIRST_COMPLETED
+                )
+                total_processed += len(done)
+
+                # Propagate any unexpected task exceptions to the log
+                for t in done:
+                    exc = t.exception()
+                    if exc:
+                        _logger.error("Task %s raised: %s", t.get_name(), exc)
+
+        return CrawlResult(
+            pages_crawled=self._pages_crawled,
+            pages_failed=self._pages_failed,
+            new_urls_discovered=self._new_urls_discovered,
+            results=self._results,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public module-level function
+# ---------------------------------------------------------------------------
+
+async def crawl(
+    seed_urls: List[str],
+    query: str,
+    max_depth: int = 2,
+    max_pages: int = 200,
+    min_relevance: float = 0.3,
+) -> CrawlResult:
+    """
+    Recursively crawl from *seed_urls*, prioritising links relevant to *query*.
+
+    All requests are routed through the Tor SOCKS5 proxy configured in
+    TOR_PROXY_HOST / TOR_PROXY_PORT.  Returns a CrawlResult dataclass.
+    """
+    spider = Spider(
+        seed_urls=seed_urls,
+        query=query,
+        max_depth=max_depth,
+        max_pages=max_pages,
+        min_relevance=min_relevance,
+    )
+    return await spider.run()

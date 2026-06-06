@@ -1,0 +1,14 @@
+FROM alpine:latest
+
+# Install Tor, curl, and python3 (for TCP socket healthcheck in docker-compose)
+RUN apk add --no-cache tor curl python3 \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+# Expose SOCKS5 port
+EXPOSE 9050
+
+# Run Tor as the tor user
+USER tor
+
+# Configure Tor to listen on all interfaces
+CMD ["tor", "--SocksPort", "0.0.0.0:9050"]

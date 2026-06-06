@@ -1,0 +1,1144 @@
+# Open_Intel Technical Reference
+
+This document describes the current state of the Open_Intel codebase. It is intended for community contributors, security researchers integrating Open_Intel into existing workflows, and developers building on top of the platform.
+
+---
+
+## Table of Contents
+
+1. [Architecture Overview](#1-architecture-overview)
+2. [Investigation Pipeline](#2-investigation-pipeline)
+3. [Intelligence Sources](#3-intelligence-sources)
+4. [Entity Extraction](#4-entity-extraction)
+5. [Enrichment Sources](#5-enrichment-sources)
+6. [Graph System](#6-graph-system)
+7. [Content Safety](#7-content-safety)
+8. [Data Quality Features](#8-data-quality-features)
+9. [Export Formats](#9-export-formats)
+10. [Monitoring System](#10-monitoring-system)
+11. [API Reference](#11-api-reference)
+12. [Configuration Reference](#12-configuration-reference)
+13. [Known Limitations](#13-known-limitations)
+
+---
+
+## 1. Architecture Overview
+
+### 1.1 Docker Services
+
+Four services compose the stack (`infra/docker-compose.yml`):
+
+| Service | Image / Build | Host Port | Role |
+|---|---|---|---|
+| `postgres` | postgres:16-alpine | 5433 → 5432 | Persistent storage for all investigation data |
+| `tor` | custom Dockerfile.tor | 9050 → 9050 | SOCKS5 proxy for all `.onion` requests |
+| `fastapi` | custom Dockerfile.fastapi | 8000 → 8000 | Python 3.11 backend; runs the investigation pipeline |
+| `nextjs` | custom Dockerfile.nextjs | 3001 → 3000 | Next.js 14 frontend |
+
+### 1.2 Service Communication
+
+- **nextjs → fastapi**: HTTP via `NEXT_PUBLIC_API_URL` (set to `http://fastapi:8000` inside Docker). All requests carry a `Bearer` JWT.
+- **fastapi → postgres**: SQLAlchemy 2.x via `DATABASE_URL`.
+- **fastapi → tor**: all outbound `.onion` requests use `aiohttp-socks` SOCKS5 at `TOR_PROXY_HOST:TOR_PROXY_PORT`. Clearnet enrichment calls (OTX, abuse.ch, CISA, etc.) bypass Tor.
+- **fastapi ↔ redis**: optional; used for JWT token blacklisting and rate-limit counters. Falls back gracefully when unavailable.
+- `postgres` health check gates `fastapi` startup. `tor` health check gates `fastapi` startup. `fastapi` health check gates `nextjs` startup.
+
+### 1.3 Database Schema
+
+All tables are in `db/models.py`. Primary keys are UUID4 generated in Python (integer autoincrement for `users`, `monitor_alerts`, `actor_style_profiles`, `user_api_keys`, `content_safety_events`). DateTime columns are timezone-aware UTC. Enums are stored as `VARCHAR` for PostgreSQL/SQLite portability.
+
+#### Tables
+
+**`investigations`** — one row per pipeline run
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | pipeline run identifier |
+| `run_id` | UUID unique | alternate lookup key |
+| `query` | Text | original user query |
+| `refined_query` | Text nullable | LLM-refined query |
+| `model_used` | String(100) | LLM model ID used |
+| `preset` | String(50) | summary preset name |
+| `summary` | Text | final LLM-generated report |
+| `status` | String(20) | `pending` / `processing` / `completed` / `completed_no_results` / `cancelled` / `failed` |
+| `graph_status` | String(20) | `pending` / `built` / `skipped_overflow` / `no_data` |
+| `current_step` | Integer | 0–9; progress counter |
+| `current_step_label` | String(200) | human-readable step label |
+| `entity_count` | Integer | count updated during extraction |
+| `page_count` | Integer | scraped page count |
+| `is_seed` | Boolean | marks seed-only investigations |
+| `user_id` | Integer FK → users | owner (SET NULL on delete) |
+| `created_at` | DateTime TZ | |
+
+**`sources`** — canonical `.onion` domain registry (global, deduped by address)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `onion_address` | String(255) unique | bare `.onion` hostname |
+| `status` | String(20) | `active` / `down` / `unknown` |
+| `source_type` | String(30) | `search_result` / `crawled` / `seed` / `telegram` |
+| `first_seen` | DateTime TZ | |
+| `last_seen` | DateTime TZ | |
+
+**`investigation_sources`** — many-to-many junction: investigations ↔ sources
+
+| Column | Type |
+|---|---|
+| `investigation_id` | UUID FK (CASCADE) |
+| `source_id` | UUID FK (CASCADE) |
+| `added_at` | DateTime TZ |
+
+**`pages`** — individual scraped pages (URL-level)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `source_id` | UUID FK → sources (SET NULL) | |
+| `url` | Text unique | |
+| `raw_content_hash` | String(64) | SHA-256 of raw content |
+| `cleaned_text` | Text | trafilatura-extracted text |
+| `scrape_timestamp` | DateTime TZ | when Open_Intel scraped it |
+| `posted_at` | DateTime TZ nullable | content authored date (rarely available) |
+| `language` | String(10) | detected language |
+| `byte_size` | Integer | |
+| `created_at` | DateTime TZ | |
+
+**`entities`** — structured intelligence artifacts
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `page_id` | UUID FK → pages (CASCADE) | |
+| `investigation_id` | UUID FK → investigations (SET NULL) | |
+| `entity_type` | String(50) | see Section 4 for full list |
+| `value` | Text | raw extracted value |
+| `canonical_value` | String indexed | normalised value |
+| `confidence` | Float | 0.0–1.0 |
+| `context_snippet` | Text | surrounding text at extraction time |
+| `historical_context` | Text | notes from enrichment sources |
+| `extraction_method` | String(10) | `regex` / `ner` / `llm` |
+| `source_count` | Integer | number of sources corroborating |
+| `corroborating_sources` | Text | comma-separated source names |
+| `first_seen` / `last_seen` | DateTime TZ | |
+| `first_seen_at` / `last_seen_at` | DateTime TZ | DB-level timestamps |
+
+> `Entity.context` is a Python property alias for `context_snippet` kept for backward compatibility. Do not remove.
+
+**`entity_relationships`** — directed edges between two entities
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `entity_a_id` | UUID FK → entities (CASCADE) | source |
+| `entity_b_id` | UUID FK → entities (CASCADE) | target |
+| `relationship_type` | String(50) | see `RelationshipType` enum |
+| `confidence` | Float | |
+| `source_page_id` | UUID FK → pages (SET NULL) | page that produced this edge |
+| `investigation_id` | UUID FK → investigations (SET NULL) | |
+| `first_seen` | DateTime TZ | |
+
+Relationship types: `CO_APPEARED_ON`, `POSTED_BY`, `LINKED_TO`, `PAID_TO`, `MEMBER_OF`, `USED`, `CLAIMED`, `LIKELY_SAME_ACTOR`, `CONFIRMED_SAME_ACTOR`, `FUNDED_BY`, `POSSIBLE_SAME_AUTHOR`
+
+**`investigation_entity_links`** — cross-investigation entity deduplication junction
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `entity_id` | UUID FK → entities (CASCADE) | |
+| `investigation_id` | UUID FK → investigations (CASCADE) | |
+| `linked_at` | DateTime TZ | |
+
+**`actor_style_profiles`** — aggregated stylometry fingerprints
+
+| Column | Type |
+|---|---|
+| `id` | Integer PK autoincrement |
+| `canonical_value` | String indexed |
+| `entity_type` | String |
+| `style_vector` | JSON |
+| `sample_count` | Integer |
+| `total_chars` | Integer |
+| `last_updated` | DateTime TZ |
+
+Unique constraint: `(canonical_value, entity_type)`
+
+**`users`** — authentication and access control
+
+| Column | Type |
+|---|---|
+| `id` | Integer PK autoincrement |
+| `email` | String(255) unique |
+| `hashed_password` | String (bcrypt) |
+| `is_active` | Boolean |
+| `must_reset_password` | Boolean |
+| `created_at` | DateTime TZ |
+| `last_login_at` | DateTime TZ nullable |
+
+**`user_api_keys`** — per-user encrypted API key storage
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | Integer PK autoincrement | |
+| `user_id` | Integer FK → users (CASCADE) | |
+| `key_name` | String(64) | e.g. `OTX_API_KEY` |
+| `encrypted_value` | Text | Fernet (AES-128) |
+| `created_at` / `updated_at` | DateTime TZ | |
+
+Unique constraint: `(user_id, key_name)`
+
+**`monitor_alerts`** — alert history from the monitoring system
+
+| Column | Type |
+|---|---|
+| `id` | Integer PK autoincrement |
+| `monitor_name` | String indexed |
+| `triggered_at` | DateTime TZ indexed |
+| `change_type` | String(50) |
+| `summary` | Text |
+| `diff_data` | JSON |
+| `severity` | String(20): `info` / `warning` / `critical` |
+| `entity_count_delta` | Integer |
+| `delivered` | Boolean |
+| `delivery_channels` | JSON |
+| `acknowledged` | Boolean |
+| `acknowledged_at` | DateTime TZ nullable |
+
+**`content_safety_events`** — audit log for content safety blocks
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | Integer PK autoincrement | |
+| `event_type` | String(50) | `query_blocked` / `url_blocked` / `content_blocked` |
+| `user_id` | Integer nullable | |
+| `content_hash` | String(64) | SHA-256 prefix of blocked item; never actual content |
+| `timestamp` | DateTime TZ | |
+
+### 1.4 Redis Usage
+
+Redis is optional (`REDIS_URL`). When present it stores:
+
+- **JWT blacklist**: revoked tokens from `POST /auth/logout`. On Redis failure the blacklist check silently passes (fail-open).
+- **Rate-limit counters**: `slowapi` uses Redis for distributed rate limiting. Falls back to in-memory counting when Redis is unavailable.
+
+In-process Python dicts (`_infra_cluster_cache`, `_sources_used_cache`, `_cancel_flags`) are used for per-investigation state that does not need to survive restarts.
+
+### 1.5 CLI Interface
+
+Open_Intel also ships as a pip-installable CLI. The CLI uses a local SQLite database and config under `~/.open_intel/`, and it shares the same search, scraping, extraction, and enrichment modules as the Docker stack.
+
+#### Installation
+
+```bash
+pip install open_intel
+```
+
+#### Configuration and Data Paths
+
+| Path | Purpose |
+|---|---|
+| `~/.open_intel/config.json` | Saved CLI config: LLM provider, model, API keys, Tor proxy, and output directory |
+| `~/.open_intel/investigations.db` | SQLite database used by `open_intel list`, `show`, `export`, and `enrich` |
+| `~/.open_intel/results/` | Default output directory for JSON and Markdown reports |
+
+#### Commands and Flags
+
+| Command | Common flags | Notes |
+|---|---|---|
+| `open_intel investigate "<query>"` | `--output`, `--model`, `--no-tor`, `--no-llm`, `--depth`, `--format`, `--quiet`, `--no-banner` | Runs the full local pipeline and writes report files |
+| `open_intel show [target]` | `--no-tui` | Opens the entity browser, or prints a summary table for scripted use |
+| `open_intel export <target>` | `--format`, `--output` | Exports STIX, MISP, Sigma, CSV, MD, or JSON from a saved investigation |
+| `open_intel enrich <target>` | `--skip-ips`, `--skip-domains`, `--skip-hashes`, `--skip-emails` | Re-runs post-processing enrichment against current feeds |
+| `open_intel list` | `--limit`, `--json` | Lists saved investigations from the local SQLite DB |
+| `open_intel status` | top-level `--no-banner` | Shows config, API key status, Tor reachability, and spaCy status |
+| `open_intel configure` | `llm`, `keys`, `tor` | First-run wizard and targeted configuration subcommands |
+
+#### Tor Detection
+
+The CLI checks for a local Tor SOCKS5 proxy in this order:
+
+1. `127.0.0.1:9050`
+2. `127.0.0.1:9150`
+3. The configured `tor.host` / `tor.port` from `~/.open_intel/config.json`
+
+Use `--no-tor` for clearnet-only investigations.
+
+#### Differences from Docker
+
+- No built-in Tor; a local Tor install or Tor Browser proxy is required for dark web sources.
+- SQLite is used instead of PostgreSQL.
+- The entity browser is a terminal TUI rather than the sigma.js graph UI.
+- Monitoring and scheduled alerts are not included.
+- Multi-user auth and JWT-backed API routes are not included.
+- spaCy (`en_core_web_sm`) auto-installs on first use if it is missing.
+
+---
+
+## 2. Investigation Pipeline
+
+### 2.1 Triggering
+
+`POST /investigations` — rate-limited to **3 requests per minute** per IP. Creates the DB row synchronously and returns immediately; the pipeline runs as a FastAPI `BackgroundTasks` coroutine.
+
+Content safety check runs at intake: if the query matches `BLOCKED_TERMS` or `BLOCKED_PATTERNS`, the request is rejected with HTTP 400 and the event is logged to `content_safety_events`.
+
+### 2.2 Step Labels (STEP_LABELS map)
+
+The `current_step` field in the `investigations` table uses these labels. The UI displays `total_steps: 13` but the pipeline uses 9 numbered labels — several numbered steps contain multiple internal sub-steps that are not separately labeled in the DB.
+
+| Step | Label |
+|---|---|
+| 1 | Refining query |
+| 2 | Searching dark web |
+| 3 | Filtering results |
+| 4 | Scraping pages |
+| 5 | Extracting entities |
+| 6 | Enriching intelligence |
+| 7 | Building graph |
+| 8 | Generating summary |
+| 9 | Finalizing results |
+
+### 2.3 Full Pipeline Sequence
+
+**Step 0 — Model selection and status init**
+- Resolves the LLM model; marks investigation `processing`.
+
+**Step 1 — LLM query refinement**
+- Calls `refine_query()` to shorten the user query to ≤5 words optimised for Tor search engine indexing.
+- Falls back to the original query if the LLM call fails.
+- Persists `refined_query` to the DB.
+- Cancellation checkpoint after this step.
+
+**Step 1.5 — Multilingual query expansion**
+- Calls `i18n.query_expand.expand_query()` to produce translated variants.
+- Configured by `I18N_LANGUAGES` (default `en,ru,zh`).
+- Falls back to English-only if the i18n module is unavailable.
+
+**Seed URL injection (before search fan-out)**
+- `SeedManager.get_relevant_seeds()` scores `data/onion_seeds.json` entries against the query by tag and name matching; returns up to 10 relevant seeds.
+- Seed URLs are prepended to the scrape queue; they bypass the LLM filter.
+
+**Steps 2–4 (parallel) — 7 concurrent tasks with a 300-second hard cap**
+
+All 7 tasks run simultaneously via `asyncio.gather(..., return_exceptions=True)`. One task failing never cancels the others. The 300s cap applies to the entire group; each task also has its own inner timeout.
+
+| Task | Inner timeout | Description |
+|---|---|---|
+| Search + filter | 180s search, no separate filter cap | Fan-out to 16+ Tor search engines per language; LLM filter selects relevant URLs |
+| Threat intel enrichment | 60s per query | OTX, MalwareBazaar, ThreatFox, URLhaus, ransomware.live, CISA, Shodan, VT (all parallel) |
+| Recursive crawler | 120s | Optional; only runs when `run_crawler: true` in the request |
+| Paste sites | 120s | Clearnet sweep of Pastebin, dpaste, paste.ee, Rentry |
+| GitHub | 180s | Clearnet code search + repo READMEs |
+| GitLab | 180s | Clearnet code search + project pages |
+| RSS feeds | 120s | Curated security blog feed scraping; 1h per-URL cache |
+
+After the parallel phase, enrichment-derived `.onion` seed URLs (e.g., ransomware.live leak sites) are appended to the scrape queue.
+
+Cancellation checkpoint after this step.
+
+**Step 4.5 — Vector cache lookup**
+- `vector.store.bulk_check_cache()` checks ChromaDB for pages seen within the last 24 hours.
+- Cache hits skip the Tor scrape. Misses go to Step 5.
+
+**Step 5 — Tor scraping**
+- `scraper.scrape.scrape_multiple()` — async `aiohttp-socks` scraper; 1 MB cap per page; `trafilatura` for text extraction; exponential backoff; max 12 concurrent workers.
+- SSRF validation (`validate_urls_for_scraping`) blocks unsafe URLs before scraping.
+- Paste, GitHub, GitLab, and RSS pages bypass this step entirely — they inject pre-fetched text directly into the extraction pool.
+
+**Step 5.5 — Vector cache write**
+- New pages with >100 characters are stored in ChromaDB with `source: "scraper"` metadata.
+
+**Step 5.75 — Content safety scan (Layer 4)**
+- `sanitize_content()` scans each page's text for CSAM/gore terms.
+- Flagged pages are discarded entirely; their URLs are hashed (SHA-256 prefix) and logged to `content_safety_events`. The original text is never stored.
+- Cancellation checkpoint after scraping.
+
+**Step 5.7 — Language detection**
+- `i18n.detect.detect_language()` tags each page's detected language; results are logged but not stored in the DB.
+
+**Step 6 — Entity extraction**
+- `extract_entities_from_pages()` runs the 4-stage extraction pipeline (regex → NER → LLM → normalise) concurrently across all pages; max 5 concurrent pages.
+- Confidence filter: entities below 0.80 are dropped before DB write.
+- Entity cap: 400 per investigation (see Section 4).
+- Cancellation checkpoint after extraction.
+
+**Step 6.1 — IP reputation enrichment**
+- `sources/ip_reputation.py` enriches `IP_ADDRESS` entities (up to 50 per investigation).
+- **Feodo Tracker** (abuse.ch) and **C2IntelFeeds** (montysecurity/C2-Tracker, 6 frameworks): IPs on either list are tagged `C2` and their confidence is raised to 1.0. Both are public and require no key. Blocklists are cached in-memory and refreshed every `C2_FEED_CACHE_TTL` hours.
+- **AbuseIPDB** (`ABUSEIPDB_API_KEY`): abuse confidence score and usage type. Skipped if key absent. Free tier: 1,000 checks/day.
+- **GreyNoise** (`GREYNOISE_API_KEY`): classifies IPs as `benign_scanner`, `malicious`, or `unknown`. IPs classified `benign_scanner` are suppressed from the entity list before DB write. Skipped if key absent.
+- `MALWARE_FAMILY` entities are auto-created from C2 feed framework names and linked to the source IP.
+
+**Step 6.2 — Domain reputation enrichment**
+- `sources/domain_reputation.py` enriches `DOMAIN` and `DOMAIN_NAME` entities (up to 30 per investigation). All three sources run concurrently per domain.
+- **crt.sh**: certificate transparency log lookup; returns subdomains as new `DOMAIN` entities. No key required.
+- **URLScan.io** (`URLSCAN_API_KEY`): fetches existing scan results, malicious verdict, and communicating IPs. Key is optional; public scan results are available without one. `URLSCAN_SUBMIT=true` submits a new scan (public — disabled by default for OPSEC).
+- **Wayback Machine**: CDX API query for historical snapshots; tags domains with an `ARCHIVED` flag when historical content exists. No key required.
+- Results are cached 24 h (crt.sh, Wayback) or 6 h (URLScan.io).
+
+**Step 6.3 — Hash reputation enrichment**
+- `sources/hash_reputation.py` enriches `FILE_HASH_MD5`, `FILE_HASH_SHA1`, `FILE_HASH_SHA256` entities (up to 50 per investigation; SHA-256 prioritised). All sources are queried concurrently. Cache TTL: 48 h.
+- **MalwareBazaar** and **ThreatFox**: family classification and IOC confidence. Both free; `ABUSECH_API_KEY` optional (improves rate limits).
+- **Hybrid Analysis** (`HYBRID_ANALYSIS_API_KEY`): behavioral verdict, AV detection ratio, and contacted IPs/domains from dynamic analysis. Skipped if key absent. Free tier available.
+- **VirusTotal** (`VT_API_KEY`): AV detection data and sandbox network IOCs. Skipped if key absent.
+- `MALWARE_FAMILY` entities are auto-created from confirmed family names and linked to the source hash.
+
+**Step 6.4 — Email reputation enrichment**
+- `sources/email_reputation.py` enriches `EMAIL_ADDRESS` entities (up to 30 per investigation).
+- **Disposable domain blocklist**: refreshed daily from the `disposable-email-domains` public list; matched emails are tagged `DISPOSABLE`. No key required.
+- **EmailRep** (`EMAILREP_API_KEY`): reputation score, suspicious flag, and platform presence (spam lists, data breaches). Works at reduced rate without a key. Cache TTL: 12 h.
+- **HaveIBeenPwned** (`HIBP_API_KEY`): breach names, dates, and data classes. Skipped if key absent. Paid: $3.50/month. Cache TTL: 24 h.
+- Custom-domain email addresses also produce new `DOMAIN` entities for downstream enrichment.
+
+**Step 6.5 — Cross-reference with seed data**
+- `db.queries.cross_reference_with_seeds()` links extracted entities against the `investigation_entity_links` table.
+
+**Step 6.6 — Stylometry profiles**
+- Builds actor writing-style vectors and upserts them in `actor_style_profiles`.
+
+**Step 6.7 — Blockchain wallet enrichment**
+- For up to 10 `BITCOIN_ADDRESS` / `ETHEREUM_ADDRESS` entities, queries BlockCypher (BTC/ETH) and Etherscan (ETH).
+- Adds `PAID_TO` edges in the entity graph.
+- Requires `BLOCKCYPHER_TOKEN` / `ETHERSCAN_API_KEY`; skipped if keys are absent.
+
+**Step 6.8 — DNS/WHOIS enrichment**
+- Calls `sources.dns_enrichment.enrich_with_dns()` on extracted IP and domain entities (up to 20 IPs, 20 domains).
+- Queries CIRCL PDNS, CIRCL PSSL, and RDAP. Optionally queries SecurityTrails.
+- Populates `infrastructure_clusters` in the in-process `_infra_cluster_cache`; updates `sources_used`.
+
+**Step 7 — Graph construction**
+- `graph.builder.build_graph_from_db()` builds a NetworkX `MultiDiGraph` from DB entities.
+- `persist_graph_edges()` writes edges to `entity_relationships`.
+- Edge overflow rules apply (see Section 6).
+- Sets `graph_status` to `built` or `skipped_overflow`.
+
+**Step 8 — LLM summary**
+- `generate_summary()` produces a structured threat intelligence briefing from all extracted pages and entities.
+- Falls back to a plain count summary if the LLM call fails.
+
+**Step 9 — Finalise**
+- Marks investigation `completed`; updates `sources_used_cache`.
+- On any unhandled exception, marks `failed` and stores the error message in `summary`.
+
+### 2.4 Cancellation
+
+`POST /investigations/{id}/cancel` sets `_cancel_flags[investigation_id] = True`.
+
+Checkpoints (where the pipeline actually honours the flag): after Step 1, after the parallel phase, after Step 5, and after Step 6.
+
+When cancelled:
+- The DB `status` is set to `cancelled`.
+- All entities and pages written up to the checkpoint are preserved — partial results are available via the normal GET endpoints.
+- The `_cancel_flags` entry is cleared.
+
+> **Single-worker caveat**: cancellation works only when the HTTP cancel request reaches the same uvicorn worker process that is running the pipeline. In multi-worker deployments this is not guaranteed.
+
+---
+
+## 3. Intelligence Sources
+
+### 3.1 Tor Search Fan-out
+
+16+ `.onion` search engines are queried concurrently. Search is weighted by engine reliability (`ENGINE_WEIGHTS` in `search/search.py`). Queries are sent in all languages returned by the multilingual expansion step (default: English, Russian, Chinese).
+
+Search results are deduplicated, sorted by engine weight, and passed to the LLM filter. The filter selects the most relevant URLs; up to 150 total URLs are passed to the scrape queue (filtered top results + remainder from raw search output).
+
+**Current reality**: the Tor search engine landscape is highly volatile. As of the writing of this document, only 3 of the 16+ configured engines reliably return results. The others time out silently.
+
+### 3.2 Clearnet Parallel Sources
+
+These sources run in the same parallel phase as the Tor search and do not use Tor.
+
+#### Paste Sites (`PASTE_SCRAPING_ENABLED`)
+
+| Source | Search method |
+|---|---|
+| Pastebin | Search endpoint + raw paste fetch |
+| dpaste.org | Search endpoint |
+| paste.ee | Search endpoint |
+| Rentry.co | Search endpoint |
+
+Controlled by `PASTE_MAX_RESULTS` (default 15). Paste pages bypass the Tor scrape step and inject their pre-fetched text directly into the extraction pool.
+
+#### GitHub (`GITHUB_SCRAPING_ENABLED`)
+
+Queries the GitHub code search API. Without a token: 10 req/min. With `GITHUB_TOKEN`: 30 req/min. Returns file content and repository READMEs. Controlled by `GITHUB_MAX_RESULTS` (default 15). Bypasses the Tor scrape step.
+
+#### GitLab (`GITLAB_SCRAPING_ENABLED`)
+
+Queries the GitLab code search API. Without a token: ~15 req/min. With `GITLAB_TOKEN`: ~60 req/min. Controlled by `GITLAB_MAX_RESULTS` (default 15). Bypasses the Tor scrape step.
+
+#### RSS Security Feeds (`RSS_FEEDS_ENABLED`)
+
+Articles from curated threat intelligence blogs. Feed results are cached per-URL for 1 hour. Maximum article age: 90 days. Controlled by `RSS_MAX_ARTICLES` (default 20). Bypasses the Tor scrape step.
+
+Configured feeds include: Krebs on Security, BleepingComputer, The Record by Recorded Future, Cisco Talos, Mandiant, CrowdStrike, Unit 42, CISA, and others.
+
+### 3.3 Seed URLs
+
+`data/onion_seeds.json` is a JSON catalogue of curated `.onion` addresses organised by category. The `SeedManager` scores entries against the query using tag and name matching and returns up to 10 relevant seeds. Seeds are injected before the search fan-out and bypass the LLM filter. The seed file refreshes weekly (Sunday 03:00 UTC) via the APScheduler job.
+
+---
+
+## 4. Entity Extraction
+
+### 4.1 Extraction Pipeline
+
+Four stages run per page in `extractor/pipeline.py`:
+
+1. **Regex** (`extractor/regex_patterns.py`): pattern-based extraction for cryptographically structured types (wallet addresses, hashes, CVEs, onion URLs, IPs, emails, PGP blocks, phone numbers).
+2. **NER** (`extractor/ner.py`): dictionary/heuristic named-entity recognition for actor handles, malware families, organisation names, person names.
+3. **LLM** (`extractor/llm_extract.py`): optional; runs when regex/NER already found entities. Augments and contextualises the combined set.
+4. **Normalisation** (`extractor/normalizer.py`): canonicalises values, deduplicates, resolves type conflicts, assigns confidence scores.
+
+Regex results take precedence over NER results for shared entity types.
+
+### 4.2 Entity Types
+
+The following entity type strings appear in the codebase. The `TYPE_PRIORITY` map controls how conflicting extractions are resolved when an entity's type is ambiguous.
+
+**Priority 1 — Critical IOCs** (highest precedence in conflict resolution)
+
+`CVE`, `CVE_NUMBER`, `IP_ADDRESS`, `IPV6_ADDRESS`, `FILE_HASH`, `FILE_HASH_MD5`, `FILE_HASH_SHA1`, `FILE_HASH_SHA256`, `FILE_HASH_SHA512`, `ONION_URL`, `DOMAIN`, `DOMAIN_NAME`
+
+**Priority 2 — Threat actors**
+
+`MALWARE_FAMILY`, `RANSOMWARE_GROUP`, `THREAT_ACTOR`, `THREAT_ACTOR_HANDLE`
+
+**Priority 3 — Cryptocurrency**
+
+`BITCOIN_ADDRESS`, `MONERO_ADDRESS`, `ETHEREUM_ADDRESS`, `WALLET`
+
+**Priority 4 — Identity markers**
+
+`EMAIL_ADDRESS`, `PGP_KEY_BLOCK`
+
+**Priority 5 — Organisations and people**
+
+`ORGANIZATION_NAME`, `PERSON_NAME`
+
+**Unranked** (recognised by the graph builder but absent from the priority map)
+
+`DATE`, `PASTE_URL`, `PHONE_NUMBER`, `MITRE_TECHNIQUE`
+
+### 4.3 Per-Type Sub-Caps
+
+Applied before the global cap to prevent high-volume low-specificity types from crowding out high-value IOCs:
+
+| Entity Type | Sub-cap |
+|---|---|
+| `ORGANIZATION_NAME` | 50 |
+| `THREAT_ACTOR_HANDLE` | 80 |
+| `PERSON_NAME` | 30 |
+| `LOCATION` | 20 |
+
+### 4.4 Global Entity Cap
+
+- Confidence threshold: entities below **0.80** are dropped before any cap logic.
+- Global cap: **400 entities** per investigation.
+- Ranking when cap is applied (descending priority): confidence score → type priority (lower number = higher priority) → occurrence count across pages.
+- Capped entities are logged with a warning; partial results are preserved.
+
+### 4.5 Type Conflict Resolution
+
+`resolve_entity_type_conflicts()` in `extractor/normalizer.py` resolves cases where the same value was extracted as two different entity types. The higher-priority type (lower `TYPE_PRIORITY` number) wins. If both types have the same priority, both records are kept.
+
+---
+
+## 5. Enrichment Sources
+
+All enrichment runs during the parallel phase (Steps 2–4) and again after extraction for DNS. Each source wraps its HTTP calls in a 30-second `aiohttp.ClientTimeout`. The entire enrichment task has a 60-second per-query cap; the outer parallel phase has a 300-second hard cap.
+
+### 5.1 Threat Intel Enrichment (parallel, Steps 2–4)
+
+All six sources below run concurrently via a single `asyncio.gather()` inside `sources/enrichment.py`.
+
+| Source | What it returns | Key required | Free tier |
+|---|---|---|---|
+| **AlienVault OTX** | Threat pulses: malware families, MITRE ATT&CK IDs, IOCs for top 5 pulses | `OTX_API_KEY` — skipped if absent | N/A; key required |
+| **MalwareBazaar** | Malware samples by tag then by signature; SHA-256, MD5, family, first/last seen | `ABUSECH_API_KEY` — optional; improves rate limits | Yes |
+| **ThreatFox** | IOCs by search term or last 24h feed; ioc_type, ioc_value, malware, confidence | `ABUSECH_API_KEY` — optional | Yes |
+| **URLhaus** | Malicious URLs by tag; url_status, threat, reporter | `ABUSECH_API_KEY` — optional | Yes |
+| **ransomware.live** | Group profiles, leak-site `.onion` addresses, recent victim claims; also injects `.onion` seeds into the scrape queue | None | Yes (public API) |
+| **Secondary enrichment** (`_enrich_new_sources`) | Calls CISA, Shodan, VirusTotal, and historical intel concurrently (55s cap) | Varies — see below | Varies |
+
+#### Secondary enrichment sources (nested, 55-second cap)
+
+| Source | What it enriches | Key required |
+|---|---|---|
+| **CISA KEV** | CVE entities: vendor, product, exploitation date, description | None |
+| **CISA Advisories** | Advisory titles, URLs, dates correlated to the query | None |
+| **Shodan InternetDB** | IP entities: open ports, hostnames, tags, known CVEs | None (free public API) |
+| **VirusTotal** | File hash entities: detection ratio, threat label, first/last seen | `VT_API_KEY` — skipped if absent; free tier: 4 req/min; max 20 hashes |
+| **MITRE ATT&CK overlay** | Technique IDs (T-codes) for actors identified from OTX/ransomware.live | None (local lookup via `historical_intel.py`) |
+| **Historical intel** | MITRE ATT&CK group profiles, FBI/DOJ press releases, CISA historical advisories | None |
+
+### 5.2 DNS/WHOIS Enrichment (Step 6.8)
+
+Runs after entity extraction using the extracted IP and domain entities. Capped at 20 IPs and 20 domains. 0.5-second delay between CIRCL requests.
+
+| Source | What it enriches | Key required |
+|---|---|---|
+| **CIRCL PDNS** | Passive DNS history for IPs and domains | None |
+| **CIRCL PSSL** | SSL certificate history | None |
+| **RDAP (ARIN / rdap.org)** | WHOIS/registration data for IPs and domains | None |
+| **SecurityTrails** | Detailed DNS history | `SECURITYTRAILS_API_KEY` — skipped if absent; free tier: 50 queries/month |
+
+**Infrastructure cluster detection**: after CIRCL/RDAP results are processed, `_detect_infrastructure_clusters()` groups IPs and domains sharing the same ASN, CIDR block, or WHOIS registrant into clusters. Clusters are stored in `_infra_cluster_cache` and returned in the investigation detail endpoint as `infrastructure_clusters`.
+
+### 5.3 Blockchain Enrichment (Step 6.7)
+
+| Source | What it enriches | Key required |
+|---|---|---|
+| **BlockCypher** | BTC and ETH wallet addresses: balance, transaction count, related addresses | `BLOCKCYPHER_TOKEN` — skipped if absent |
+| **Etherscan** | ETH wallet addresses: balance, transactions | `ETHERSCAN_API_KEY` — skipped if absent |
+
+Creates `PAID_TO` edges in the entity graph between wallets that transacted. Limited to 10 wallets per investigation.
+
+### 5.4 IP Reputation Enrichment (Step 6.1)
+
+| Source | What it enriches | Key required | Free tier |
+|---|---|---|---|
+| **Feodo Tracker** | C2 IPs for banking trojans and ransomware loaders | None | Yes (public) |
+| **C2IntelFeeds** | C2 IPs for Cobalt Strike, Sliver, Metasploit, Brute Ratel, PoshC2, Havoc | None | Yes (public) |
+| **AbuseIPDB** | Abuse confidence score; usage type | `ABUSEIPDB_API_KEY` — skipped if absent | Yes; 1,000 checks/day |
+| **GreyNoise** | Scanner classification; suppresses `benign_scanner` IPs before DB write | `GREYNOISE_API_KEY` — skipped if absent | Free tier available |
+
+C2 feed blocklists are refreshed in-memory every `C2_FEED_CACHE_TTL` hours (default 24). IPs confirmed as C2 receive confidence 1.0 and a `C2` badge in the UI. `MALWARE_FAMILY` entities may be auto-created from C2 framework names.
+
+### 5.5 Domain Reputation Enrichment (Step 6.2)
+
+| Source | What it enriches | Key required | Free tier | Cache TTL |
+|---|---|---|---|---|
+| **crt.sh** | Subdomains from certificate transparency logs | None | Yes | 24 h |
+| **URLScan.io** | Live scan data, malicious verdict, communicating IPs | `URLSCAN_API_KEY` — optional | Yes (public results) | 6 h |
+| **Wayback Machine** | Historical snapshot availability; `ARCHIVED` tag | None | Yes | 24 h |
+
+`URLSCAN_SUBMIT=false` (default): only retrieves existing scan results. When `true`, Open_Intel submits new scans — note that URLScan.io scans are publicly indexed and may reveal investigation targets to domain operators.
+
+### 5.6 Hash Reputation Enrichment (Step 6.3)
+
+| Source | What it enriches | Key required | Free tier |
+|---|---|---|---|
+| **MalwareBazaar** | Malware family, AV coverage, first/last seen | `ABUSECH_API_KEY` — optional | Yes |
+| **ThreatFox** | Malware family, IOC confidence, associated IOCs | `ABUSECH_API_KEY` — optional | Yes |
+| **Hybrid Analysis** | Behavioral verdict, AV detection ratio, contacted IPs/domains | `HYBRID_ANALYSIS_API_KEY` — skipped if absent | Yes (registration required) |
+| **VirusTotal** | AV detection ratio, sandbox network IOCs | `VT_API_KEY` — skipped if absent | Yes (4 req/min) |
+
+Cache TTL: 48 h (hashes are immutable). Up to 50 hashes per investigation; SHA-256 is prioritised over SHA-1 and MD5. `MALWARE_FAMILY` entities are auto-created from confirmed family names and linked to the source hash entity.
+
+### 5.7 Email Reputation Enrichment (Step 6.4)
+
+| Source | What it enriches | Key required | Free tier | Cache TTL |
+|---|---|---|---|---|
+| **Disposable domain blocklist** | Known throwaway email domains; `DISPOSABLE` tag | None | Yes (public list) | 24 h |
+| **EmailRep** | Reputation score, suspicious flag, platform presence | `EMAILREP_API_KEY` — optional | Reduced rate without key | 12 h |
+| **HaveIBeenPwned** | Breach names, dates, exposed data classes | `HIBP_API_KEY` — skipped if absent | No ($3.50/month) | 24 h |
+
+Custom-domain email addresses (non-disposable, non-freemail) also produce new `DOMAIN` entities for downstream domain reputation enrichment.
+
+### 5.8 Entity Enrichment Pipeline Summary
+
+The following table maps all post-extraction enrichment steps to their pipeline position, entity types, and source modules.
+
+| Step | Entity types enriched | Sources | Config |
+|---|---|---|---|
+| **6.1** IP reputation | `IP_ADDRESS` (up to 50) | Feodo Tracker, C2IntelFeeds, AbuseIPDB, GreyNoise | `ABUSEIPDB_API_KEY`, `GREYNOISE_API_KEY`, `C2_FEED_CACHE_TTL` |
+| **6.2** Domain reputation | `DOMAIN`, `DOMAIN_NAME` (up to 30) | crt.sh, URLScan.io, Wayback Machine | `URLSCAN_API_KEY`, `URLSCAN_SUBMIT` |
+| **6.3** Hash reputation | `FILE_HASH_MD5/SHA1/SHA256` (up to 50) | Hybrid Analysis, MalwareBazaar, ThreatFox, VirusTotal | `HYBRID_ANALYSIS_API_KEY`, `VT_API_KEY`, `ABUSECH_API_KEY` |
+| **6.4** Email reputation | `EMAIL_ADDRESS` (up to 30) | HIBP, EmailRep, disposable blocklist | `HIBP_API_KEY`, `EMAILREP_API_KEY` |
+| **6.7** Blockchain | `BITCOIN_ADDRESS`, `ETHEREUM_ADDRESS` (up to 10) | BlockCypher, Etherscan | `BLOCKCYPHER_TOKEN`, `ETHERSCAN_API_KEY` |
+| **6.8** DNS/WHOIS | `IP_ADDRESS`, `DOMAIN` (up to 20 each) | CIRCL PDNS, CIRCL PSSL, RDAP, SecurityTrails | `SECURITYTRAILS_API_KEY`, `DNS_ENRICHMENT_ENABLED` |
+
+All enrichment steps are wrapped in `try/except` with graceful fallback. A failing enrichment source never fails the investigation.
+
+---
+
+## 6. Graph System
+
+### 6.1 Node Construction
+
+`graph/builder.py` builds a NetworkX `MultiDiGraph`. Each entity maps to a node type:
+
+| Entity type | Graph node type |
+|---|---|
+| `THREAT_ACTOR_HANDLE` | `threat_actor` |
+| `BITCOIN_ADDRESS`, `ETHEREUM_ADDRESS`, `MONERO_ADDRESS` | `crypto_wallet` |
+| `ONION_URL` | `onion_url` |
+| `EMAIL_ADDRESS` | `email_address` |
+| `PGP_KEY_BLOCK` | `pgp_key` |
+| `CVE_NUMBER` | `vulnerability` |
+| `PASTE_URL` | `paste` |
+| `MALWARE_FAMILY` | `malware_family` |
+| `RANSOMWARE_GROUP` | `ransomware_group` |
+| `IP_ADDRESS` | `ip_address` |
+| `PHONE_NUMBER` | `phone_number` |
+| `ORGANIZATION_NAME` | `organization` |
+| `FILE_HASH_MD5`, `FILE_HASH_SHA1`, `FILE_HASH_SHA256` | `file_hash` |
+| `MITRE_TECHNIQUE` | `technique` |
+| `DATE` | `date` |
+
+Entity types not in this mapping are skipped (they generate no graph node).
+
+**Node ID disambiguation**: `THREAT_ACTOR_HANDLE` nodes are keyed as `handle@forum-domain` so the same handle on two different forums produces two distinct nodes, enabling the `LIKELY_SAME_ACTOR` inference pass.
+
+**Node size**: base 10; boosted by 5 for each additional page the entity appears on (cap 40).
+
+### 6.2 Edge Construction
+
+Three passes during `build_graph_from_db()`:
+
+1. **Intra-page edges**: for every page with 2+ entities, `CO_APPEARED_ON` edges are created between all pairs (confidence 1.0).
+2. **Cross-page edges**: entities shared across multiple pages bridge those pages' unique-entity sets with `CO_INVESTIGATION` edges (confidence 0.3–0.4).
+3. **Persisted relationship edges**: explicit `entity_relationships` rows written during enrichment (e.g., `PAID_TO` from blockchain) are loaded and added.
+
+### 6.3 Relationship Inference
+
+`infer_relationships()` adds two types of derived edges:
+
+- **PGP key reuse** (`CONFIRMED_SAME_ACTOR`, confidence 0.95): if a PGP key node is adjacent to 2+ threat actor nodes, those actors likely share an identity.
+- **Handle similarity** (`LIKELY_SAME_ACTOR`, confidence 0.6): two threat actor nodes with the same handle value (case-insensitive) but different forum domains.
+
+### 6.4 Edge Overflow Behaviour
+
+Applied by `persist_graph_edges()` before writing to the DB:
+
+| Edge count | Behaviour |
+|---|---|
+| ≤ 10,000 | All edges written |
+| 10,001 – 50,000 | **Pruning**: edges where either entity has confidence < 0.85 are dropped |
+| > 50,000 | **Overflow skip**: all edges skipped; `graph_status` set to `skipped_overflow` |
+
+Return statuses: `written`, `pruned`, `skipped_overflow`.
+
+### 6.5 `graph_status` Values
+
+| Value | Meaning |
+|---|---|
+| `pending` | Graph not yet built |
+| `built` | Graph written successfully (may have been pruned) |
+| `skipped_overflow` | Edge count exceeded 50,000; graph skipped |
+| `no_data` | Investigation completed with no results |
+
+---
+
+## 7. Content Safety
+
+Six mandatory layers. None can be disabled via configuration.
+
+| Layer | Where | What is checked | Action on match |
+|---|---|---|---|
+| 1 — Query intake | `POST /investigations` handler | `BLOCKED_TERMS` list + `BLOCKED_PATTERNS` regexes | HTTP 400; event logged |
+| 2 — URL pre-scan | `is_blocked_url()` before any scraping | `BLOCKED_URL_TERMS` (pedo, loli, jailbait, csam, hurtcore, bestgore, etc.) | URL silently dropped |
+| 3 — Paste/RSS content | `sanitize_content()` in paste and RSS scrapers | `CONTENT_BLOCKLIST` | Page silently dropped |
+| 4 — Scraped content | `sanitize_content()` in Step 5.75 | `CONTENT_BLOCKLIST` | Page discarded; URL hash logged |
+| 5 — Post-extraction entity values | `is_blocked_entity_value()` in `extract_entities_from_pages()` | `ENTITY_VALUE_BLOCKLIST` against `_TEXT_ENTITY_TYPES` only | Entity silently dropped |
+| 6 — Audit logging | All block events | SHA-256 prefix of blocked item | Written to `content_safety_events` |
+
+**`_TEXT_ENTITY_TYPES`** (Layer 5 applies only to these):
+`ORGANIZATION_NAME`, `THREAT_ACTOR_HANDLE`, `PERSON_NAME`, `MALWARE_FAMILY`
+
+Technical IOC types (hashes, IPs, CVEs, wallet addresses, onion URLs) are intentionally excluded from Layer 5. They cannot contain prohibited content by definition.
+
+**Log hygiene**: actual prohibited text is never logged anywhere in the system. Only event type, user ID, and a hash prefix are stored.
+
+---
+
+## 8. Data Quality Features
+
+### 8.1 IOC Freshness Decay
+
+`utils/ioc_freshness.py` assigns a `FreshnessTag` to entities based on `last_seen_at` and entity type:
+
+| Entity type | Fresh (days) | Aging (days) | Stale (days) | Expired |
+|---|---|---|---|---|
+| `IP_ADDRESS` | ≤ 14 | ≤ 30 | ≤ 90 | > 90 |
+| `DOMAIN` | ≤ 30 | ≤ 90 | ≤ 180 | > 180 |
+| `ONION_URL` | ≤ 60 | ≤ 180 | ≤ 365 | > 365 |
+| `FILE_HASH_MD5`, `FILE_HASH_SHA256` | ≤ 365 | ≤ 730 | ≤ 1825 | > 1825 |
+| `CVE` | ≤ 365 | ≤ 730 | ≤ 1825 | > 1825 |
+| `BITCOIN_ADDRESS` | ≤ 90 | ≤ 180 | ≤ 365 | > 365 |
+| `THREAT_ACTOR` | ≤ 90 | ≤ 365 | ≤ 730 | > 730 |
+| Default (all others) | ≤ 30 | ≤ 90 | ≤ 180 | > 180 |
+
+Tags: `fresh`, `aging`, `stale`, `expired`, `unknown`
+
+### 8.2 Cross-Source Confidence
+
+`Entity.source_count` tracks how many distinct sources corroborated an entity. `Entity.corroborating_sources` stores the source names. Higher source counts increase effective confidence during triage.
+
+### 8.3 Defanged Output
+
+`utils/defang.py` provides:
+
+- `defang_url()`: `http://` → `hxxp://`, dots in hostname → `[.]`
+- `defang_ip()`: last octet → `[.]x`
+- `defang_email()`: `@` → `[@]`, dots → `[.]`
+- `defang_value(entity_type, value)`: dispatches by type
+- `defang_text(text)`: defangs all URLs and IPs in free text
+
+Defanging is applied to the frontend display when the `defang` toggle is enabled (`defangEnabled` state in the investigation page, defaulting to `true`). It is not applied to DB storage.
+
+### 8.4 Sources Panel
+
+The investigation detail endpoint returns `sources_used` — a dict showing which intelligence sources ran and what they found:
+
+```json
+{
+  "otx": "ok_3_results",
+  "virustotal": "skipped_no_key",
+  "malwarebazaar": "ok_7_results",
+  "threatfox": "ok_12_results",
+  "urlhaus": "ok_0_results",
+  "ransomware_live": "ok_1_results",
+  "cisa": "ok_2_results",
+  "shodan": "ok_0_results",
+  "tor_search": "ok_45_pages",
+  "github": "ok_8_results",
+  "gitlab": "ok_3_results",
+  "paste_sites": "ok_5_results",
+  "rss_feeds": "ok_12_results",
+  "ip_reputation": "ok_6_enrichments",
+  "greynoise": "ok_2_suppressed",
+  "abuseipdb": "ok_6_enrichments",
+  "domain_reputation": "ok_4_enrichments",
+  "urlscan": "ok_3_enrichments",
+  "hash_reputation": "ok_3_enrichments",
+  "hybrid_analysis": "skipped_no_key",
+  "email_reputation": "ok_2_enrichments",
+  "hibp": "skipped_no_key",
+  "emailrep": "ok_2_enrichments",
+  "circl_pdns": "ok_4_enrichments",
+  "securitytrails": "skipped_no_key"
+}
+```
+
+Possible status values: `ok_N_results`, `ok_N_pages`, `ok_N_enrichments`, `skipped_no_key`, `skipped_disabled`, `error`, `pending`.
+
+### 8.5 Infrastructure Cluster Detection
+
+After DNS enrichment, entities sharing the same ASN, CIDR block, or WHOIS registrant are grouped into clusters. Clusters appear in `investigation.infrastructure_clusters` and are surfaced in the `InfrastructureClusters` UI component.
+
+The cluster data is stored in the in-process `_infra_cluster_cache` dict and is lost on container restart.
+
+---
+
+## 9. Export Formats
+
+All export endpoints are at `/export/{id}/{format}` and require a valid JWT.
+
+### 9.1 STIX 2.1
+
+`export/stix.py` produces a STIX 2.1 Bundle containing:
+
+- `Indicator` objects for technical IOCs (IPs, domains, hashes, onion URLs)
+- `ThreatActor` objects for extracted threat actor handles
+- `Malware` objects for malware families
+- `Relationship` objects derived from `entity_relationships`
+- `Report` object with the investigation summary and referenced objects
+
+### 9.2 MISP JSON
+
+`export/misp.py` produces a MISP-compatible event JSON:
+
+- One MISP Event per investigation
+- Attributes mapped from entity types to MISP attribute categories
+- Galaxy clusters for malware families and threat actors
+- Tags from OTX pulse tags and MITRE ATT&CK technique IDs
+
+### 9.3 Sigma Rules
+
+`export/sigma.py` auto-generates Sigma YAML detection rules from extracted IOCs:
+
+- Network-level rules for IP addresses and domains
+- File-level rules for hashes
+- One rule per high-confidence indicator
+
+### 9.4 CSV
+
+Flat entity dump with columns:
+
+`entity_type`, `value`, `canonical_value`, `confidence`, `first_seen`, `last_seen`, `source_count`, `corroborating_sources`, `context_snippet`
+
+---
+
+## 10. Monitoring System
+
+### 10.1 How Monitors Work
+
+Monitors are defined in `data/monitors.yaml`. Each monitor has:
+
+- `name`: unique identifier and APScheduler job ID
+- `type`: `keyword` or `url`
+- `interval_hours`: how often the watch runs
+- `enabled`: boolean toggle
+
+**Keyword watches** (`monitor/jobs.py:run_keyword_watch`): run a new investigation for the monitor's keyword; diff the entity list against the previous run; fire alerts on new entities.
+
+**URL watches** (`monitor/jobs.py:run_url_watch`): scrape a specific URL over Tor; diff the extracted text using `monitor/diff.py`; fire alerts on significant changes.
+
+### 10.2 Scheduling
+
+`monitor/scheduler.py` starts an `apscheduler.schedulers.asyncio.AsyncIOScheduler` at API startup. Jobs:
+
+- One `IntervalTrigger(hours=N)` job per enabled watch
+- `weekly_seed_refresh`: `CronTrigger(day_of_week="sun", hour=3, minute=0)` — refreshes `data/onion_seeds.json`
+- `seed_validation`: `CronTrigger(day_of_week="sun", hour=2, minute=0)` — validates `.onion` seed reachability over Tor
+
+`max_instances=1` and `coalesce=True` prevent overlapping runs of the same watch.
+
+### 10.3 Alert Delivery
+
+`monitor/alerts.py` dispatches alerts through configured channels:
+
+- **Telegram bot**: sends formatted alert messages to a chat ID
+- **SMTP email**: sends HTML alert emails
+
+Alert records are persisted to `monitor_alerts`. The `delivered` field tracks whether delivery succeeded; `acknowledged` tracks operator review.
+
+---
+
+## 11. API Reference
+
+All routes except `/auth/*`, `/health`, `/healthz/*` require `Authorization: Bearer <token>`.
+
+### 11.1 Authentication
+
+```
+POST /auth/login        — { email, password } → { access_token, token_type }
+POST /auth/logout       — blacklists the current token
+POST /auth/register     — create account (admin only in default config)
+```
+
+### 11.2 Investigations
+
+```
+POST   /investigations                         — trigger investigation (3/min rate limit)
+GET    /investigations                         — list investigations (paginated)
+GET    /investigations/{id}                    — investigation detail + sources_used + clusters
+GET    /investigations/{id}/entities           — entity list (filterable by type, confidence)
+GET    /investigations/{id}/graph              — graph JSON (nodes + edges)
+POST   /investigations/{id}/cancel             — request cancellation
+DELETE /investigations/{id}                    — delete investigation and all associated data
+```
+
+### 11.3 Entities
+
+```
+GET    /entities                               — global entity search
+GET    /entities/{id}                          — entity detail
+```
+
+### 11.4 Export
+
+```
+GET    /export/{id}/stix                       — STIX 2.1 JSON bundle
+GET    /export/{id}/misp                       — MISP event JSON
+GET    /export/{id}/sigma                      — Sigma YAML rules (zip)
+GET    /export/{id}/csv                        — entity CSV
+```
+
+### 11.5 Monitors
+
+```
+GET    /monitors                               — list configured watches + job status
+POST   /monitors/{name}/trigger                — trigger a watch immediately
+GET    /monitors/alerts                        — list alerts (filterable by severity, monitor)
+PATCH  /monitors/alerts/{id}/acknowledge       — mark alert acknowledged
+```
+
+### 11.6 Admin
+
+```
+GET    /admin/users                            — list users
+POST   /admin/users                            — create user
+DELETE /admin/users/{id}                       — delete user
+```
+
+### 11.7 Health
+
+```
+GET    /health                                 — DB + Tor connectivity check (no auth)
+GET    /healthz/live                           — liveness probe (no auth)
+GET    /healthz/ready                          — readiness probe (no auth)
+GET    /debug/tor-test                         — test Tor connectivity (JWT required)
+GET    /debug/search-test                      — test search engine (JWT required)
+```
+
+### 11.8 Rate Limits
+
+| Endpoint | Limit |
+|---|---|
+| `POST /investigations` | 3 per minute per IP |
+| All other protected routes | No per-route limit configured (global middleware present but not enforcing per-route) |
+
+`DISABLE_RATE_LIMIT=true` bypasses all rate limiting (development only).
+
+---
+
+## 12. Configuration Reference
+
+Copy `.env.example` to `.env`. The API reads all values at startup via `config.py`, which strips accidentally-quoted values and provides typed defaults.
+
+### 12.1 Required
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DATABASE_URL` | — | PostgreSQL connection string. Format: `postgresql://user:pass@host:port/db` |
+| `JWT_SECRET` | — | Minimum 32-byte hex string. Auto-generated by `setup.sh`; **must be set in production**. |
+
+### 12.2 LLM Providers
+
+At least one LLM provider key is needed for query refinement, result filtering, and summary generation. If no key is present, the pipeline falls back to unfiltered top-100 search results and skips the summary.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DEFAULT_MODEL` | `openrouter/deepseek/deepseek-chat` | Model ID used when the request does not specify one. Format: `provider/model-name` |
+| `OPENAI_API_KEY` | — | Enables GPT-4o, GPT-4o Mini, etc. |
+| `ANTHROPIC_API_KEY` | — | Enables Claude models |
+| `GOOGLE_API_KEY` | — | Enables Gemini models |
+| `OPENROUTER_API_KEY` | — | Enables all OpenRouter-proxied models |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Override for self-hosted OpenRouter |
+| `GROQ_API_KEY` | — | Enables Groq fast inference |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Enables local Ollama models |
+| `LLAMA_CPP_BASE_URL` | `http://127.0.0.1:8080` | Enables llama.cpp server |
+
+### 12.3 Threat Intelligence Enrichment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `OTX_API_KEY` | — | AlienVault OTX. Required; skipped if absent. |
+| `VT_API_KEY` | — | VirusTotal. Required; skipped if absent. Free tier: 4 req/min. |
+| `ABUSECH_API_KEY` | — | abuse.ch (MalwareBazaar, ThreatFox, URLhaus). Optional; improves rate limits. |
+
+### 12.4 Blockchain Enrichment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `BLOCKCYPHER_TOKEN` | — | BlockCypher for BTC/ETH wallet lookups. Optional. |
+| `ETHERSCAN_API_KEY` | — | Etherscan for ETH wallet lookups. Optional. |
+
+### 12.5 Clearnet Scrapers
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PASTE_SCRAPING_ENABLED` | `true` | Set `false` to disable paste site scraping |
+| `PASTE_MAX_RESULTS` | `15` | Max pastes to fetch per investigation |
+| `GITHUB_SCRAPING_ENABLED` | `true` | Set `false` to disable GitHub scraping |
+| `GITHUB_TOKEN` | — | Personal access token. No scopes needed. Increases rate limit from 10 to 30 req/min |
+| `GITHUB_MAX_RESULTS` | `15` | Max GitHub results per investigation |
+| `GITLAB_SCRAPING_ENABLED` | `true` | Set `false` to disable GitLab scraping |
+| `GITLAB_TOKEN` | — | Personal access token. No scopes needed. Increases rate limit from ~15 to ~60 req/min |
+| `GITLAB_MAX_RESULTS` | `15` | Max GitLab results per investigation |
+| `RSS_FEEDS_ENABLED` | `true` | Set `false` to disable RSS feed scraping |
+| `RSS_MAX_ARTICLES` | `20` | Max RSS articles per investigation |
+
+### 12.6 DNS/WHOIS Enrichment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DNS_ENRICHMENT_ENABLED` | `true` | Set `false` to skip CIRCL/RDAP enrichment |
+| `SECURITYTRAILS_API_KEY` | — | Optional. Provides richer DNS history. Free tier: 50 queries/month |
+
+### 12.7 Caching and Rate Limiting
+
+| Variable | Default | Notes |
+|---|---|---|
+| `REDIS_URL` | — | Redis connection string. Optional. When absent, JWT blacklist fails open and rate-limit counters are in-memory |
+| `DISABLE_RATE_LIMIT` | `false` | Set `true` to bypass all rate limiting (development only) |
+
+### 12.8 Tor
+
+| Variable | Default | Notes |
+|---|---|---|
+| `TOR_PROXY_HOST` | `127.0.0.1` | SOCKS5 host. Docker Compose sets this to `tor` (the service name) |
+| `TOR_PROXY_PORT` | `9050` | SOCKS5 port |
+
+### 12.9 Internationalisation
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DEEPL_API_KEY` | — | DeepL translation. Optional; falls back to Helsinki-NLP local models |
+| `I18N_LANGUAGES` | `en,ru,zh` | Comma-separated language codes for multilingual query expansion |
+
+### 12.10 Playwright
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PLAYWRIGHT_ENABLED` | `true` | Enables JS-rendered `.onion` page scraping. Set `false` to save memory (~400 MB) |
+
+### 12.11 IP Reputation Enrichment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ABUSEIPDB_API_KEY` | — | AbuseIPDB community abuse reports. Optional; skipped if absent. Free tier: 1,000 checks/day |
+| `GREYNOISE_API_KEY` | — | GreyNoise scanner classification. Optional; skipped if absent. IPs classified `benign_scanner` are removed from entity results before DB write |
+| `C2_FEED_CACHE_TTL` | `24` | Hours between in-memory refreshes of the Feodo Tracker and C2IntelFeeds blocklists |
+
+### 12.12 Domain Reputation Enrichment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `URLSCAN_API_KEY` | — | URLScan.io scan data. Optional; public scan results are available without a key at reduced rate |
+| `URLSCAN_SUBMIT` | `false` | When `true`, Open_Intel submits new URLScan.io scans for domains with no existing result. Scans are **publicly indexed** — keep `false` for OPSEC-sensitive investigations |
+
+### 12.13 Hash Reputation Enrichment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `HYBRID_ANALYSIS_API_KEY` | — | Hybrid Analysis behavioral sandbox. Optional; skipped if absent. Free tier available at hybrid-analysis.com |
+
+### 12.14 Email Reputation Enrichment
+
+| Variable | Default | Notes |
+|---|---|---|
+| `HIBP_API_KEY` | — | HaveIBeenPwned breach history. Optional; skipped if absent. Paid: $3.50/month individual plan |
+| `EMAILREP_API_KEY` | — | EmailRep reputation scoring. Optional; works at reduced rate without a key |
+
+---
+
+## 13. Known Limitations
+
+### CLI Requires Local Tor
+
+The CLI probes `127.0.0.1:9050`, then `127.0.0.1:9150`, then the configured Tor proxy. If none respond, dark web investigations stop unless `--no-tor` is used for clearnet-only runs.
+
+### spaCy Auto-Installs on First Use
+
+The CLI installs `en_core_web_sm` automatically if it is missing. First run can stall on locked-down machines or on hosts without network access to PyPI.
+
+### Tor Search Engine Coverage
+
+Only 3 of the 16+ configured `.onion` search engines reliably return results. The others time out silently. Queries that depend on dark web search surface area will return far fewer results than the engine count implies.
+
+### Tor Circuit Saturation
+
+Concurrent investigations share the same Tor SOCKS5 proxy. Performance degrades significantly with 2–3 simultaneous investigations. The 1 MB per-page scrape cap limits individual circuit load, but concurrent queries to different search engines can exhaust the circuit pool.
+
+### OpenRouter Free Tier Rate Limits
+
+Free-tier models on OpenRouter enforce per-minute rate limits. The pipeline has exponential backoff with up to 4 retries per LLM call, parsing the `X-RateLimit-Reset` header to determine wait time. Investigations involving many LLM calls (refinement + filter + summary) can stall for several minutes under rate limiting.
+
+### JWT Blacklist Fails Open When Redis is Down
+
+`POST /auth/logout` writes revoked tokens to Redis. If Redis is unavailable, the logout call silently succeeds but the token remains valid until its JWT expiry time. This is the intended fallback to avoid blocking all auth on a Redis outage, but it means logout is best-effort without Redis.
+
+### In-Process Cache Reset on Container Restart
+
+`_infra_cluster_cache` (infrastructure clusters) and `_sources_used_cache` (sources panel data) are Python dicts in the FastAPI process. They are lost on container restart or worker reload. After a restart, completed investigations will return empty `infrastructure_clusters` and `sources_used` for investigations run before the restart.
+
+### Temporal Analysis Uses Scrape Time, Not Content Time
+
+`Page.scrape_timestamp` records when Open_Intel visited a page — not when the content was authored. `Page.posted_at` exists for authored dates but is rarely populated (paste sites and RSS feeds populate it; `.onion` scrapes almost never do). Temporal analysis panels are therefore based on Open_Intel scrape time, which can skew activity histograms for old content.
+
+### `detect_pgp_reuse()` Not Called
+
+`analysis/opsec.py` implements `detect_pgp_reuse()` but `run_full_opsec_analysis()` never calls it. PGP key reuse detection at the graph level (via `infer_relationships()`) is still functional; the OPSEC-panel method is dead code.
+
+### Debug Endpoints Are Unauthenticated at Network Level
+
+`GET /debug/tor-test` and `GET /debug/search-test` require a JWT since the audit (they are behind `Depends(get_current_user)`), but they expose internal connectivity status. Consider removing them before public deployment.
+
+### Single-Worker Cancellation Only
+
+`_cancel_flags` is an in-process dict. Cancellation works only when the HTTP cancel request and the pipeline background task run in the same uvicorn worker process. Multi-worker deployments (e.g., `--workers 4`) break cancellation for investigations running on a different worker.

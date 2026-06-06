@@ -1,0 +1,63 @@
+# VoidAccess production dependencies (unpinned)
+# Run: pip-compile requirements.in --output-file requirements.txt
+
+bs4
+pysocks
+requests
+streamlit
+python-dotenv
+langchain-openai
+langchain-ollama
+backports.tarfile
+langchain-anthropic
+langchain_community
+langchain_google_genai
+
+# Phase 1A — persistent database
+sqlalchemy[asyncio]>=2.0
+alembic
+psycopg2-binary
+
+# Phase 1B — async scraper
+aiohttp
+aiohttp-socks
+trafilatura
+
+# Phase 1C — recursive crawler
+sentence-transformers
+
+# Phase 1D — expanded sources
+telethon
+
+# Phase 2 — entity extraction pipeline
+spacy
+# run: python -m spacy download en_core_web_sm
+
+# Phase 3 — graph relationship mapping
+networkx
+pyvis
+
+# Phase 4 — monitoring + vector memory
+chromadb
+apscheduler
+pyyaml
+filelock
+
+# Phase 5 — industry-standard exports + REST API
+fastapi
+uvicorn[standard]
+stix2
+python-multipart
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+slowapi
+limits
+
+# Phase 6 — advanced capabilities
+langdetect
+
+# Phase 7 — JS rendering for dark web sites (requires playwright browsers)
+playwright==1.44.0
+
+# Auth — token blacklist
+redis>=5.0

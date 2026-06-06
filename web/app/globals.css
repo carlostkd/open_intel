@@ -1,0 +1,264 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Backgrounds — layered depth */
+  --bg-void:    #080b11;   /* Deepest background (dark navy) */
+  --bg-surface: #0d1117;   /* Card/panel backgrounds */
+  --bg-raised:  #161b22;   /* Elevated elements */
+  --bg-overlay: #1c2128;   /* Hover states, selected */
+
+  /* Borders — subtle structure */
+  --border-dim:    rgba(255, 255, 255, 0.06);
+  --border-subtle: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.18);
+
+  /* Text — clear hierarchy */
+  --text-primary:   #e6edf3;  /* Main content */
+  --text-secondary: #8b949e;  /* Supporting text */
+  --text-muted:     #6e7681;  /* Disabled, placeholders */
+  --text-inverse:   #080b11;  /* Text on light backgrounds */
+
+  /* Accent — single, restrained */
+  --accent:         #9B9FEE;  /* Lavender: brand accent */
+  --accent-dim:     rgba(155, 159, 238, 0.15);
+  --accent-border:  rgba(155, 159, 238, 0.30);
+
+  /* Semantic */
+  --danger:         #f85149;  /* Errors, critical alerts */
+  --danger-dim:     rgba(248, 81, 73, 0.12);
+  --warning:        #d29922;  /* Warnings, medium severity */
+  --warning-dim:    rgba(210, 153, 34, 0.12);
+  --success:        #3fb950;  /* Completed, verified */
+  --success-dim:    rgba(63, 185, 80, 0.12);
+  --neutral:        #6e7681;  /* Neutral states */
+
+  /* Entity Types (refined, no neon) */
+  --entity-threat-actor: #e05c5c;
+  --entity-wallet:       #9B9FEE;
+  --entity-malware:      #d08770;
+  --entity-forum:        #79b8ff;
+  --entity-c2:           #b392f0;
+  --entity-cve:          #f0e68c;
+  --entity-paste:        #56b6c2;
+  --entity-onion:        #9ecbff;
+  --entity-email:        #c9a35a;
+  --entity-pgp:          #73d397;
+
+  /* ── Typography tokens — injected by Next.js onto body ─── */
+  /* var(--font-display) = Space Grotesk: headings / labels  */
+  /* var(--font-body)    = Inter: body text / UI             */
+  /* var(--font-mono)    = JetBrains Mono: code / IDs        */
+}
+
+@layer base {
+  body {
+    @apply bg-[var(--bg-void)] text-[var(--text-primary)] antialiased;
+    font-family: var(--font-body);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  h1, h2, h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+
+  h4, h5, h6 {
+    font-family: var(--font-display);
+  }
+
+  pre, code, .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+/* ── Entity / technical value classes ───────────────────────── */
+.entity-value,
+.hash-value,
+.ip-address,
+.wallet-address,
+.onion-url,
+.investigation-id {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+/* ── Animations ─────────────────────────────────────────────── */
+@keyframes dash {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes pulse-subtle {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.animate-pulse-subtle {
+  animation: pulse-subtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* ── Custom Scrollbar ────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-void);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bg-overlay);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+/* ── Abstract geometric background ───────────────────────────── */
+.abstract-bg {
+  background-color: #080B11;
+  background-image:
+    repeating-linear-gradient(
+      45deg,
+      transparent,
+      transparent 40px,
+      rgba(155, 159, 238, 0.07) 40px,
+      rgba(155, 159, 238, 0.07) 41px
+    ),
+    repeating-linear-gradient(
+      -45deg,
+      transparent,
+      transparent 40px,
+      rgba(155, 159, 238, 0.05) 40px,
+      rgba(155, 159, 238, 0.05) 41px
+    ),
+    radial-gradient(
+      circle,
+      rgba(155, 159, 238, 0.20) 1.5px,
+      transparent 1.5px
+    );
+  background-size:
+    80px 80px,
+    80px 80px,
+    30px 30px;
+  background-position:
+    0 0,
+    0 0,
+    15px 15px;
+}
+
+.abstract-bg::before {
+  content: '';
+  position: fixed;
+  top: 10%;
+  right: 15%;
+  width: 300px;
+  height: 300px;
+  border: 1px solid rgba(155, 159, 238, 0.14);
+  transform: rotate(45deg);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.abstract-bg::after {
+  content: '';
+  position: fixed;
+  bottom: 20%;
+  left: 10%;
+  width: 200px;
+  height: 200px;
+  border: 1px solid rgba(155, 159, 238, 0.09);
+  transform: rotate(45deg);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ── Node detail panel — path & cluster sections ─────────────── */
+.path-display {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.path-step {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.path-node {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(155, 159, 238, 0.15);
+  color: rgba(255, 255, 255, 0.8);
+  border: 1px solid rgba(155, 159, 238, 0.2);
+}
+
+.path-node.path-current {
+  background: rgba(155, 159, 238, 0.3);
+  color: #FFFFFF;
+  border-color: rgba(155, 159, 238, 0.5);
+}
+
+.path-node.path-hub {
+  background: rgba(16, 185, 129, 0.2);
+  color: rgba(255, 255, 255, 0.9);
+  border-color: rgba(16, 185, 129, 0.4);
+}
+
+.path-arrow {
+  color: rgba(255, 255, 255, 0.3);
+  font-size: 11px;
+}
+
+.path-note {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.3);
+  margin-top: 6px;
+  font-style: italic;
+}
+
+.panel-section {
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.section-title {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: rgba(255, 255, 255, 0.35);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+
+.context-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 6px;
+  gap: 8px;
+}
+
+.context-label {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.45);
+  flex-shrink: 0;
+}
+
+.context-value {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
+  text-align: right;
+}
+
+.context-value.mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}

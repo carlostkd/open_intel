@@ -1,0 +1,147 @@
+# ============================================================
+# VoidAccess FastAPI Dockerfile (Optimized)
+# Cold build: ~5 min | Warm rebuild: ~30s
+# ============================================================
+
+# --- Build Arguments ---
+ARG PLAYWRIGHT_ENABLED=false
+ARG GPU=false
+ARG OTX_API_KEY=""
+ARG ABUSECH_API_KEY=""
+
+# --- Builder stage ---
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Install build dependencies (apt) with cache mount
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better layer caching
+COPY requirements.txt .
+
+# Install Python dependencies with BuildKit cache mount
+# CPU-only torch if GPU=false (default), CUDA torch if GPU=true
+RUN --mount=type=cache,target=/root/.pip \
+    if [ "$GPU" = "true" ]; then \
+        pip install --no-cache-dir -r requirements.txt; \
+    else \
+        pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+        grep -vE '^(torch|torchvision)==' requirements.txt > req_no_torch.txt && \
+        pip install --no-cache-dir --no-deps -r req_no_torch.txt; \
+    fi
+
+# Install Playwright only if explicitly enabled (opt-in)
+# Always create /ms-playwright so COPY --from=builder doesn't fail when disabled
+RUN mkdir -p /ms-playwright && \
+    if [ "$PLAYWRIGHT_ENABLED" = "true" ]; then \
+        pip install --no-cache-dir playwright && \
+        PLAYWRIGHT_BROWSERS_PATH=/ms-playwright playwright install chromium && \
+        PLAYWRIGHT_BROWSERS_PATH=/ms-playwright playwright install-deps chromium; \
+    fi
+
+# Copy scripts for seed data download
+COPY scripts/ scripts/
+
+# Download seed data (handles missing keys internally)
+RUN --mount=type=cache,target=/root/.pip \
+    OTX_API_KEY=$OTX_API_KEY ABUSECH_API_KEY=$ABUSECH_API_KEY \
+    python scripts/download_seed.py || true
+
+
+# --- Runtime stage ---
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install runtime system dependencies with cache mount
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-client \
+    netcat-openbsd \
+    curl \
+    libglib2.0-0 \
+    libnss3 \
+    libnspr4 \
+    libdbus-1-3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libatspi2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN groupadd --gid 1000 voidaccess && \
+    useradd --uid 1000 --gid voidaccess --shell /bin/bash --create-home voidaccess
+
+# Copy Python packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Create directories and set ownership early
+RUN mkdir -p /data /app /ms-playwright && chown -R voidaccess:voidaccess /app /data /ms-playwright
+
+# Copy ms-playwright from builder
+COPY --from=builder /ms-playwright /ms-playwright
+
+# Copy seed data if it exists (using bracket wildcard to make it optional)
+COPY --from=builder /app/data/seed_data.json.g[z] /data/seed_data.json.gz
+
+# Copy application code (comes last for cache optimization)
+COPY --chown=voidaccess:voidaccess . .
+
+# Ensure chroma_db directory exists and is owned by the app user
+# (ChromaDB creates it at runtime; pre-creating avoids root-ownership from bind mounts)
+RUN mkdir -p /app/chroma_db && chown -R voidaccess:voidaccess /app/chroma_db
+
+# Ensure data directory exists for monitors.yaml and other runtime-written files.
+# This directory is mounted as a named Docker volume in docker-compose so it is
+# always writable by the voidaccess user regardless of the host bind-mount.
+RUN mkdir -p /app/data && chown -R voidaccess:voidaccess /app/data
+
+# Download spaCy model at runtime if not present (defer to first run)
+RUN python -c "import spacy; spacy.load('en_core_web_sm')" 2>/dev/null || \
+    python -m spacy download en_core_web_sm
+
+# Environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV TF_ENABLE_ONEDNN_OPTS=0
+ENV TF_CPP_MIN_LOG_LEVEL=3
+ENV DATABASE_URL=postgresql://voidaccess:voidaccess@postgres:5432/voidaccess
+ENV TOR_PROXY_HOST=tor
+ENV TOR_PROXY_PORT=9050
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Make entrypoint scripts executable
+RUN chmod +x /app/infra/docker-entrypoint.sh \
+    && chmod +x /app/infra/*.sh 2>/dev/null || true
+
+# Switch to non-root user
+USER voidaccess
+
+ENTRYPOINT ["/app/infra/docker-entrypoint.sh"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
