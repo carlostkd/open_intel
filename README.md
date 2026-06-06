@@ -4,18 +4,12 @@
 
 | Tool | Type | Pricing | Key Features | Differences from open_intel |
 |------|------|---------|--------------|-----------------------------|
-| **open_intel** | Open-source | Free | Multi-source aggregation, entity extraction, graph analysis, crawler, dark web (Ahmia), leak DB (IntelX), API, CLI, mo
-nitoring | — |
-| **Maltego** | Paid | ~€999/yr (CT) | Visual link analysis, 40+ transforms, graph mapping | Requires subscription for full transforms; no built-in crawler or
- dark web search |
-| **Lampyre** | Paid | ~€49/mo | Automated multi-source data enrichment, payments/crypto/social lookups | No graph analysis or self-hosting; limited to vendor
-'s data sources |
-| **SpiderFoot HX** | Paid | ~$129/yr | 200+ modules, attack surface mapping, scheduled scanning | Self-hosted but closed-source; focused on infrastructure, n
-ot social profiling |
-| **Recorded Future** | Enterprise | Custom ($$$) | Real-time threat intel, AI analysis, API, TIP integration | Enterprise-only; no self-hosting; overkill for
- individual/small-team profiling |
-| **Social Links** | Paid | ~$300/mo | Social media profiling, face recognition, cross-platform matching | No dark web / crawler; subscription lock-in for soc
-ial APIs |
+| **open_intel** | Open-source | Free | Multi-source aggregation, entity extraction, graph analysis, crawler, dark web (Ahmia), leak DB (IntelX), API, CLI, monitoring | — |
+| **Maltego** | Paid | ~€999/yr (CT) | Visual link analysis, 40+ transforms, graph mapping | Requires subscription for full transforms; no built-in crawler or dark web search |
+| **Lampyre** | Paid | ~€49/mo | Automated multi-source data enrichment, payments/crypto/social lookups | No graph analysis or self-hosting; limited to vendor's data sources |
+| **SpiderFoot HX** | Paid | ~$129/yr | 200+ modules, attack surface mapping, scheduled scanning | Self-hosted but closed-source; focused on infrastructure, not social profiling |
+| **Recorded Future** | Enterprise | Custom ($$$) | Real-time threat intel, AI analysis, API, TIP integration | Enterprise-only; no self-hosting; overkill for individual/small-team profiling |
+| **Social Links** | Paid | ~$300/mo | Social media profiling, face recognition, cross-platform matching | No dark web / crawler; subscription lock-in for social APIs |
 | **Skopenow** | Paid | Custom ($$) | Social media monitoring, location tracking, threat detection | No graph or entity extraction; black-box scoring |
 | **Videris** | Paid | Custom ($$$) | AI-assisted investigation workflow, automation, visual mapping | No self-hosting; closed-source; custom pricing |
 | **Shodan** | Freemium | ~$49/mo (pro) | Device/iot discovery, exposed services, port scanning | Single-purpose (infrastructure); no social/leak profiling |
