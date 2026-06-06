@@ -9,7 +9,7 @@
 | **IntelX Integration**    | Added [Intelligence X](https://intelx.io) as a clearnet search source for darknet markets, paste sites, leak databases, and forum content via their free API tier (`sources/intelx_scraper.py`) |
 | **Lumo LLM Provider**     | Added [Proton Lumo](https://lumo.proton.me) alongside OpenAI, Anthropic, Google, Groq, and Ollama                                                          |
 | **`--no-refine` Flag**    | Skips LLM query refinement while retaining LLM for filtering and summary; useful when using original query verbatim                                         |
-| **Content Safety Removed**| Mandatory content-safety filters from the original VoidAccess have been removed. Unrestricted operational scope guarantees zero barriers to data acquisition and analysis—no query, URL, or content blocking |
+| **Content Safety Removed**| Mandatory content-safety filters from the original VoidAccess have been removed. Unrestricted operational scope guarantees zero barriers to data acquisition and analysis no query, URL, or content blocking |
 | **Updated Branding**      | Logo, banner, and tagline updated to "Dark and Clear WEB OSINT Intelligence"                                                                                |
 
 ## Quick Start
