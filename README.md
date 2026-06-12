@@ -45,12 +45,23 @@
 ### CLI (No Docker, 30 Seconds)
 
 git clone https://github.com/carlostkd/open_intel.git
+
 cd open_intel
+```
 pip install -r requirements.txt
+```
+```
 python -m spacy download en_core_web_sm
+```
+```
 cp .env.example .env
+```
+```
 python -m open_intel_cli configure
+```
+```
 python -m open_intel_cli investigate "Android 16 CVE"
+```
 
 Requires local Tor for dark web sources:
 - Install from https://torproject.org
